@@ -1,0 +1,127 @@
+name: Apply AI Foundations License to all repos
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview only? Choose false to actually write LICENSE.md."
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+
+jobs:
+  apply-license:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Apply master LICENSE.md across alyssadata repos
+        env:
+          GH_TOKEN: ${{ secrets.LICENSE_ROLLOUT_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          OWNER: alyssadata
+          SOURCE_REPO: MASTER_AI-FOUNDATIONS_LICENSE
+          SOURCE_PATH: LICENSE.md
+        run: |
+          set -u
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "Missing repository secret: LICENSE_ROLLOUT_TOKEN"
+            exit 1
+          fi
+
+          echo "Fetching master license from ${OWNER}/${SOURCE_REPO}/${SOURCE_PATH}"
+
+          license_response=$(curl -sS \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${OWNER}/${SOURCE_REPO}/contents/${SOURCE_PATH}")
+
+          license_b64=$(echo "$license_response" | jq -r '.content // empty' | tr -d '\n')
+
+          if [ -z "$license_b64" ]; then
+            echo "Could not read master LICENSE.md."
+            echo "$license_response"
+            exit 1
+          fi
+
+          page=1
+          updated=0
+          skipped=0
+          failed=0
+
+          while true; do
+            repos_response=$(curl -sS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/user/repos?affiliation=owner&per_page=100&page=${page}")
+
+            repo_count=$(echo "$repos_response" | jq 'length')
+            if [ "$repo_count" -eq 0 ]; then
+              break
+            fi
+
+            echo "$repos_response" | jq -r --arg OWNER "$OWNER" '.[] | select(.owner.login == $OWNER) | select(.archived == false) | [.full_name, .default_branch] | @tsv' | while IFS=$'\t' read -r full_name default_branch; do
+              if [ "$full_name" = "${OWNER}/${SOURCE_REPO}" ]; then
+                echo "Skipping master license repo: $full_name"
+                continue
+              fi
+
+              echo "Processing $full_name"
+
+              existing_response=$(curl -sS -w "\n%{http_code}" \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${full_name}/contents/LICENSE.md?ref=${default_branch}")
+
+              existing_body=$(echo "$existing_response" | sed '$d')
+              existing_status=$(echo "$existing_response" | tail -n 1)
+
+              if [ "$existing_status" = "200" ]; then
+                existing_sha=$(echo "$existing_body" | jq -r '.sha')
+                payload=$(jq -n \
+                  --arg message "Apply AI Foundations Source-Line License" \
+                  --arg content "$license_b64" \
+                  --arg branch "$default_branch" \
+                  --arg sha "$existing_sha" \
+                  '{message:$message, content:$content, branch:$branch, sha:$sha}')
+              else
+                payload=$(jq -n \
+                  --arg message "Apply AI Foundations Source-Line License" \
+                  --arg content "$license_b64" \
+                  --arg branch "$default_branch" \
+                  '{message:$message, content:$content, branch:$branch}')
+              fi
+
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "DRY RUN: would write LICENSE.md to $full_name on branch $default_branch"
+                continue
+              fi
+
+              write_response=$(curl -sS -w "\n%{http_code}" \
+                -X PUT \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${full_name}/contents/LICENSE.md" \
+                -d "$payload")
+
+              write_body=$(echo "$write_response" | sed '$d')
+              write_status=$(echo "$write_response" | tail -n 1)
+
+              if [ "$write_status" = "200" ] || [ "$write_status" = "201" ]; then
+                echo "Updated $full_name"
+              else
+                echo "FAILED $full_name"
+                echo "$write_body"
+              fi
+            done
+
+            page=$((page + 1))
+          done
+
+          echo "Done. Review the log above for any failed repos."
